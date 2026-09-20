@@ -1,0 +1,941 @@
+#!/usr/bin/env python3
+"""Omaglow helper. Sets one colour on every RGB device, or follows the Omarchy theme.
+
+Most devices go through an OpenRGB server on localhost. Kingston FURY DDR5 is
+written over SMBus, because OpenRGB cannot detect it on boards that block SPD
+page switching.
+
+    omaglow status                     JSON with config, devices, theme colours
+    omaglow palette                    JSON with the theme colours only (fast)
+    omaglow apply [--if-follow] [--wait]
+    omaglow set <key> <value>          color, themeKey, follow, brightness, vivid, startup
+    omaglow device <id> on|off
+    omaglow device-color <id> <hex|theme:key|shared>
+    omaglow zone <id> <zone> <leds>    LED count for an addressable header
+    omaglow profile save
+    omaglow profile use on|off [theme]
+    omaglow profile delete [theme]
+    omaglow save <hex> / unsave <hex>  saved colours in the panel
+    omaglow forget <id>                remove a misdetected device
+    omaglow remember [name]            bring one removed device back, or all
+    omaglow setup / teardown / rescan
+"""
+
+import fcntl
+import json
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config/omarchy/omaglow"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+OPENRGB_DIR = CONFIG_DIR / "openrgb"
+CACHE_DIR = HOME / ".cache/omarchy/omaglow"
+DEVICE_CACHE = CACHE_DIR / "devices.json"
+DETECTOR_MAP = CACHE_DIR / "detectors.json"
+UNIT_DIR = HOME / ".config/systemd/user"
+THEME_NAME_FILE = HOME / ".local/state/omarchy/current/theme.name"
+HOOK_FILE = HOME / ".config/omarchy/hooks/theme-set.d/omaglow.hook"
+
+SERVER_UNIT = "omaglow-openrgb.service"
+APPLY_UNIT = "omaglow-apply.service"
+HOST = "127.0.0.1"
+PORT = 6742
+
+THEME_KEYS = ["accent", "foreground", "red", "orange", "yellow", "green", "cyan", "blue", "purple"]
+
+OFF = "#000000"
+
+DEFAULTS = {
+    "follow": False,
+    "themeKey": "accent",
+    "color": "#ffffff",
+    "brightness": 100,
+    "vivid": True,
+    "disabled": [],
+    "ignored": [],
+    "saved": [],
+    "colors": {},
+    "themeKeys": {},
+    "zones": {},
+    "profiles": {},
+    "lastTheme": "",
+    "generalAtSwitch": None,
+}
+
+HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def load_config():
+    config = dict(DEFAULTS)
+    try:
+        stored = json.loads(CONFIG_FILE.read_text())
+        if isinstance(stored, dict):
+            config.update({k: v for k, v in stored.items() if k in DEFAULTS})
+    except (OSError, ValueError):
+        pass
+    if not HEX_RE.match(str(config["color"])):
+        config["color"] = DEFAULTS["color"]
+    for key in ("disabled", "ignored", "saved"):
+        if not isinstance(config[key], list):
+            config[key] = []
+    for key in ("colors", "themeKeys", "zones"):
+        if not isinstance(config[key], dict):
+            config[key] = {}
+    for device_id, value in config["colors"].items():
+        if str(value).startswith("theme:"):
+            config["themeKeys"].setdefault(device_id, str(value)[6:])
+    config["colors"] = {k: v for k, v in config["colors"].items() if HEX_RE.match(str(v))}
+    config["themeKeys"] = {k: clean_choice(v) for k, v in config["themeKeys"].items() if clean_choice(v)}
+    config["themeKey"] = clean_choice(config["themeKey"]) or DEFAULTS["themeKey"]
+    profiles = {}
+    for slug, profile in (config["profiles"] if isinstance(config["profiles"], dict) else {}).items():
+        if not isinstance(profile, dict):
+            continue
+        keys = profile.get("themeKeys") if isinstance(profile.get("themeKeys"), dict) else {}
+        profiles[str(slug)] = {
+            "themeKey": clean_choice(profile.get("themeKey", "")) or DEFAULTS["themeKey"],
+            "themeKeys": {k: clean_choice(v) for k, v in keys.items() if clean_choice(v)},
+            "enabled": profile.get("enabled") is not False,
+        }
+    config["profiles"] = profiles
+    config["saved"] = [c for c in config["saved"] if HEX_RE.match(str(c))][:24]
+    try:
+        config["brightness"] = max(5, min(100, int(config["brightness"])))
+    except (TypeError, ValueError):
+        config["brightness"] = 100
+    return config
+
+
+def clean_choice(value):
+    value = str(value)
+    if value == "off":
+        return OFF
+    if value in THEME_KEYS:
+        return value
+    return normalize_hex(value) if HEX_RE.match(value) else ""
+
+
+def save_config(config):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n")
+    tmp.replace(CONFIG_FILE)
+
+
+def normalize_hex(value):
+    match = HEX_RE.match(str(value).strip())
+    if not match:
+        raise SystemExit(f"not a colour: {value}")
+    return "#" + match.group(1).lower()
+
+
+def theme_colors():
+    """Theme colours as resolved by omarchy-theme-color."""
+    try:
+        out = subprocess.run(["omarchy-theme-color", "--all"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    colors = {}
+    for line in out.splitlines():
+        key, _, value = line.partition("\t")
+        if HEX_RE.match(value.strip()):
+            colors[key] = normalize_hex(value)
+    return colors
+
+
+def current_theme():
+    try:
+        return THEME_NAME_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def theme_title(slug):
+    return " ".join(word.capitalize() for word in slug.split("-")) or "this theme"
+
+
+def note_theme(config):
+    """Store the general pattern when the theme changes. profile save restores it."""
+    slug = current_theme()
+    if config["lastTheme"] == slug:
+        return False
+    config["lastTheme"] = slug
+    config["generalAtSwitch"] = {"themeKey": config["themeKey"], "themeKeys": dict(config["themeKeys"])}
+    return True
+
+
+def follow_pattern(config):
+    """Return the active profile for the current theme, or the config itself."""
+    profile = config["profiles"].get(current_theme())
+    return profile if profile and profile["enabled"] else config
+
+
+def resolve(choice, palette, fallback):
+    """A choice is a theme key or a hex colour."""
+    if HEX_RE.match(str(choice)):
+        return normalize_hex(choice)
+    return palette.get(choice) or fallback
+
+
+def target_color(config, palette=None):
+    if config["follow"]:
+        palette = theme_colors() if palette is None else palette
+        return resolve(follow_pattern(config)["themeKey"], palette, palette.get("accent") or config["color"])
+    return config["color"]
+
+
+def device_color(config, device_id, palette, shared):
+    """Colour for one device. Falls back to the shared colour."""
+    if config["follow"]:
+        choice = follow_pattern(config)["themeKeys"].get(device_id)
+        return resolve(choice, palette, shared) if choice else shared
+    own = config["colors"].get(device_id)
+    return normalize_hex(own) if own else shared
+
+
+def led_color(hex_color, brightness, vivid):
+    """Apply brightness and the optional gamma correction for LEDs."""
+    rgb = [int(hex_color[i:i + 2], 16) for i in (1, 3, 5)]
+    if vivid and max(rgb) > 0:
+        peak = max(rgb)
+        curved = [(c / 255) ** 2.2 for c in rgb]
+        scale = peak / max(curved)
+        rgb = [c * scale for c in curved]
+    rgb = [max(0, min(255, round(c * brightness / 100))) for c in rgb]
+    return "%02X%02X%02X" % tuple(rgb)
+
+
+def systemctl(*args):
+    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+
+def port_open():
+    try:
+        with socket.create_connection((HOST, PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def server_pid():
+    out = systemctl("show", SERVER_UNIT, "-p", "MainPID", "--value").stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+
+def openrgb_client(*args, timeout=30):
+    # Without a server the CLI would run its own 10 second detection.
+    if not port_open():
+        return None
+    try:
+        return subprocess.run(["openrgb", "--config", str(OPENRGB_DIR), *args],
+                              capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+MODE_RE = re.compile(r"\[?'([^']+)'\]?|\[?([^\s\[\]']+)\]?")
+
+
+def parse_devices(listing):
+    devices = []
+    current = None
+    for line in (listing or "").splitlines():
+        head = re.match(r"^(\d+): (.+)$", line)
+        if head:
+            current = {"index": int(head.group(1)), "name": head.group(2).strip(),
+                       "type": "", "modes": []}
+            devices.append(current)
+        elif current and line.startswith("  Type:"):
+            current["type"] = line.split(":", 1)[1].strip()
+        elif current and line.startswith("  Modes:"):
+            current["modes"] = [a or b for a, b in MODE_RE.findall(line.split(":", 1)[1])]
+    return devices
+
+
+def pick_mode(modes):
+    for wanted in ("Static", "Direct", "Custom"):
+        if wanted in modes:
+            return wanted
+    for hint in ("static", "direct", "custom", "fixed", "solid", "steady", "constant", "always on"):
+        for mode in modes:
+            if hint in mode.lower():
+                return mode
+    return ""
+
+
+# Minimal OpenRGB SDK client, used only to read and set zone sizes.
+SDK_VERSION = 3
+SDK_CONTROLLER_COUNT, SDK_CONTROLLER_DATA, SDK_PROTOCOL, SDK_CLIENT_NAME, SDK_RESIZE = 0, 1, 40, 50, 1000
+
+
+class SdkReader:
+    def __init__(self, data):
+        self.data, self.at = data, 0
+
+    def take(self, fmt):
+        value = struct.unpack_from("<" + fmt, self.data, self.at)[0]
+        self.at += struct.calcsize(fmt)
+        return value
+
+    def text(self):
+        size = self.take("H")
+        value = self.data[self.at:self.at + size].rstrip(b"\0").decode("utf-8", "replace")
+        self.at += size
+        return value
+
+
+def sdk_send(sock, device, packet, payload=b""):
+    sock.sendall(b"ORGB" + struct.pack("<III", device, packet, len(payload)) + payload)
+
+
+def sdk_recv(sock, wanted):
+    def exactly(size):
+        data = b""
+        while len(data) < size:
+            chunk = sock.recv(size - len(data))
+            if not chunk:
+                raise OSError("server went away")
+            data += chunk
+        return data
+
+    for _ in range(16):
+        magic, _device, packet, size = struct.unpack("<4sIII", exactly(16))
+        if magic != b"ORGB" or size > 4 * 1024 * 1024:
+            raise OSError("not an OpenRGB server")
+        data = exactly(size)
+        if packet == wanted:
+            return data
+    raise OSError("no answer")
+
+
+def sdk_connect():
+    sock = socket.create_connection((HOST, PORT), timeout=5)
+    sdk_send(sock, 0, SDK_PROTOCOL, struct.pack("<I", SDK_VERSION))
+    sdk_recv(sock, SDK_PROTOCOL)
+    sdk_send(sock, 0, SDK_CLIENT_NAME, b"omaglow\0")
+    return sock
+
+
+def sdk_zones():
+    """Resizable zones (addressable headers) per device index."""
+    try:
+        with sdk_connect() as sock:
+            sdk_send(sock, 0, SDK_CONTROLLER_COUNT)
+            count = struct.unpack("<I", sdk_recv(sock, SDK_CONTROLLER_COUNT))[0]
+            found = {}
+            for device in range(min(count, 64)):
+                sdk_send(sock, device, SDK_CONTROLLER_DATA, struct.pack("<I", SDK_VERSION))
+                r = SdkReader(sdk_recv(sock, SDK_CONTROLLER_DATA))
+                r.take("I"); r.take("i")
+                for _ in range(6):
+                    r.text()
+                modes = r.take("H"); r.take("i")
+                for _ in range(modes):
+                    r.text()
+                    r.at += 12 * 4
+                    # Read into a variable first. r.at += r.take() would use the old offset.
+                    colours = r.take("H")
+                    r.at += 4 * colours
+                zones = []
+                for index in range(r.take("H")):
+                    name = r.text(); r.take("i")
+                    low, high, size = r.take("I"), r.take("I"), r.take("I")
+                    matrix = r.take("H")
+                    r.at += matrix
+                    if low != high:
+                        zones.append({"index": index, "name": name, "max": high, "size": size})
+                if zones:
+                    found[device] = zones
+            return found
+    except (OSError, struct.error):
+        return {}
+
+
+def sdk_resize(device, zone, size):
+    try:
+        with sdk_connect() as sock:
+            sdk_send(sock, device, SDK_RESIZE, struct.pack("<ii", zone, size))
+            time.sleep(0.3)
+        return True
+    except OSError:
+        return False
+
+
+def wait_for_server(seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        devices = parse_devices(openrgb_client("-l"))
+        if devices:
+            return devices
+        time.sleep(1)
+    return []
+
+
+def ensure_server(wait):
+    if systemctl("is-active", SERVER_UNIT).stdout.strip() != "active":
+        if not (UNIT_DIR / SERVER_UNIT).exists():
+            return []
+        systemctl("start", SERVER_UNIT)
+        wait = max(wait, 25)
+    return wait_for_server(wait)
+
+
+def openrgb_devices(wait=3, fresh=False):
+    """Devices from the server, cached per server pid."""
+    pid = server_pid()
+    if not fresh and pid:
+        try:
+            cached = json.loads(DEVICE_CACHE.read_text())
+            if cached.get("pid") == pid and cached.get("devices"):
+                return cached["devices"]
+        except (OSError, ValueError):
+            pass
+    devices = ensure_server(wait)
+    seen = {}
+    for device in devices:
+        seen[device["name"]] = seen.get(device["name"], 0) + 1
+        count = seen[device["name"]]
+        device["id"] = "openrgb:" + device["name"] + (f" #{count}" if count > 1 else "")
+        if count > 1:
+            device["name"] = f"{device['name']} #{count}"
+        device["mode"] = pick_mode(device["modes"])
+    config = load_config()
+    devices = [d for d in devices if d["mode"] and d["name"] not in config["ignored"]]
+    zones = sdk_zones() if devices else {}
+    for device in devices:
+        device["zones"] = zones.get(device["index"], [])
+        wanted = config["zones"].get(device["id"], {})
+        for zone in device["zones"]:
+            size = wanted.get(str(zone["index"]))
+            if isinstance(size, int) and size != zone["size"] and 0 <= size <= zone["max"]:
+                if sdk_resize(device["index"], zone["index"], size):
+                    zone["size"] = size
+    if devices:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        DEVICE_CACHE.write_text(json.dumps({"pid": server_pid(), "devices": devices}))
+    return devices
+
+
+FURY_BASE = 0x60
+
+
+def smbus_number():
+    for adapter in sorted(Path("/sys/bus/i2c/devices").glob("i2c-*")):
+        try:
+            name = (adapter / "name").read_text()
+        except OSError:
+            continue
+        if name.startswith("SMBus I801") or name.startswith("SMBus PIIX4"):
+            return adapter.name.split("-")[1]
+    return None
+
+
+def i2c_write(bus, addr, reg, value):
+    for attempt in range(1, 6):
+        done = subprocess.run(["i2cset", "-y", bus, hex(addr), hex(reg), hex(value), "b"],
+                              capture_output=True)
+        if done.returncode == 0:
+            return True
+        time.sleep(0.03 * attempt)
+    return False
+
+
+def i2c_read_high(bus, addr, reg):
+    for _ in range(3):
+        done = subprocess.run(["i2cget", "-y", bus, hex(addr), hex(reg), "w"],
+                              capture_output=True, text=True)
+        word = done.stdout.strip()
+        if done.returncode == 0 and word not in ("", "0xffff"):
+            return int(word, 16) >> 8
+        time.sleep(0.01)
+    return -1
+
+
+def fury_sticks():
+    """Find FURY DDR5 RGB controllers. Only probes slots with an spd5118 device."""
+    if not shutil.which("i2cset"):
+        return None, []
+    bus = smbus_number()
+    if bus is None or not os.access(f"/dev/i2c-{bus}", os.R_OK | os.W_OK):
+        return bus, []
+    sticks = []
+    for spd in sorted(Path("/sys/bus/i2c/devices").glob(f"{bus}-005[0-7]")):
+        try:
+            if (spd / "name").read_text().strip() != "spd5118":
+                continue
+        except OSError:
+            continue
+        addr = FURY_BASE + (int(spd.name[-1], 16))
+        if not i2c_write(bus, addr, 0x08, 0x53):
+            continue
+        time.sleep(0.01)
+        signature = "".join(chr(max(0, i2c_read_high(bus, addr, reg))) for reg in (1, 2, 3, 4))
+        i2c_write(bus, addr, 0x08, 0x44)
+        time.sleep(0.01)
+        if signature == "FURY":
+            sticks.append(addr)
+    return bus, sticks
+
+
+def fury_cached():
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    cache = CACHE_DIR / "fury.json"
+    try:
+        stored = json.loads(cache.read_text())
+        if stored.get("boot") == boot:
+            return stored["bus"], stored["sticks"]
+    except (OSError, ValueError, KeyError):
+        pass
+    bus, sticks = fury_sticks()
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"boot": boot, "bus": bus, "sticks": sticks}))
+    return bus, sticks
+
+
+def fury_apply(bus, sticks, hex_rgb, brightness):
+    def everyone(reg, value):
+        for addr in sticks:
+            i2c_write(bus, addr, reg, value)
+        time.sleep(0.01)
+
+    # Register sequence from OpenRGB's KingstonFuryDRAMController.
+    everyone(0x08, 0x53); everyone(0x0B, 0x00); everyone(0x08, 0x44)
+    everyone(0x08, 0x53)
+    everyone(0x09, 0x00)
+    everyone(0x0C, 0x01); everyone(0x0D, 0x00); everyone(0x0E, 0x00)
+    everyone(0x30, 0x01)
+    everyone(0x31, int(hex_rgb[0:2], 16))
+    everyone(0x32, int(hex_rgb[2:4], 16))
+    everyone(0x33, int(hex_rgb[4:6], 16))
+    everyone(0x20, max(0, min(100, brightness)))
+    everyone(0x27, min(4, len(sticks)))
+    everyone(0x08, 0x44)
+
+
+def all_devices(wait=3, fresh=False):
+    devices = [{"id": d["id"], "name": d["name"], "type": d["type"], "index": d["index"],
+                "mode": d["mode"], "zones": d.get("zones", [])} for d in openrgb_devices(wait, fresh)]
+    bus, sticks = (None, []) if "fury" in load_config()["ignored"] else fury_cached()
+    if sticks:
+        count = len(sticks)
+        devices.append({"id": "fury", "name": f"Kingston FURY RAM ({count} stick{'s' if count != 1 else ''})",
+                        "type": "DRAM", "bus": bus, "sticks": sticks})
+    return devices
+
+
+def apply(config, wait=3):
+    if note_theme(config):
+        save_config(config)
+    palette = theme_colors()
+    color = target_color(config, palette)
+    devices = all_devices(wait)
+    args = []
+    for device in devices:
+        if device["id"] in config["disabled"]:
+            continue
+        own = device_color(config, device["id"], palette, color)
+        if device["id"] == "fury":
+            fury_apply(device["bus"], device["sticks"],
+                       led_color(own, 100, config["vivid"]), config["brightness"])
+        else:
+            args += ["-d", str(device["index"]), "-m", device["mode"], "-c",
+                     led_color(own, config["brightness"], config["vivid"])]
+    if args:
+        openrgb_client(*args)
+    return color
+
+
+def status(wait=3, fresh=False):
+    config = load_config()
+    palette = theme_colors()
+    devices = all_devices(wait, fresh)
+    shared = target_color(config, palette)
+    pattern = follow_pattern(config)
+    for device in devices:
+        device["enabled"] = device["id"] not in config["disabled"]
+        own = pattern["themeKeys"] if config["follow"] else config["colors"]
+        device["own"] = device["id"] in own
+        device["themeKey"] = pattern["themeKeys"].get(device["id"], pattern["themeKey"])
+        device["fixed"] = config["colors"].get(device["id"], config["color"])
+        device["color"] = device_color(config, device["id"], palette, shared)
+    swatches = [{"key": key, "color": palette[key]} for key in THEME_KEYS if key in palette]
+    return {
+        "config": config,
+        "color": shared,
+        "themeKey": pattern["themeKey"],
+        **theme_report(config),
+        "devices": devices,
+        "theme": swatches,
+        "setup": (UNIT_DIR / SERVER_UNIT).exists(),
+        "startup": startup_enabled(),
+        "server": systemctl("is-active", SERVER_UNIT).stdout.strip() == "active",
+        "openrgb": shutil.which("openrgb") is not None,
+    }
+
+
+def theme_report(config):
+    slug = current_theme()
+    profile = config["profiles"].get(slug)
+    return {
+        "general": {"themeKey": config["themeKey"], "themeKeys": config["themeKeys"]},
+        "profilePattern": {"themeKey": profile["themeKey"], "themeKeys": profile["themeKeys"]} if profile else None,
+        "themeSlug": slug,
+        "themeName": theme_title(slug),
+        "profile": {"exists": profile is not None, "enabled": bool(profile and profile["enabled"])},
+        "profiles": [{"slug": k, "name": theme_title(k), "enabled": v["enabled"]}
+                     for k, v in sorted(config["profiles"].items())],
+    }
+
+
+def profile_command(action, argument, slug):
+    config = load_config()
+    slug = slug or current_theme()
+    if action == "save" and slug:
+        pattern = follow_pattern(config)
+        config["profiles"][slug] = {"themeKey": pattern["themeKey"],
+                                    "themeKeys": dict(pattern["themeKeys"]), "enabled": True}
+        config["follow"] = True
+        before = config["generalAtSwitch"]
+        if pattern is config and slug == config["lastTheme"] and isinstance(before, dict):
+            config["themeKey"] = clean_choice(before.get("themeKey", "")) or config["themeKey"]
+            config["themeKeys"] = {k: clean_choice(v) for k, v in (before.get("themeKeys") or {}).items() if clean_choice(v)}
+    elif action == "use" and slug in config["profiles"]:
+        config["profiles"][slug]["enabled"] = argument == "on"
+    elif action == "delete":
+        config["profiles"].pop(slug, None)
+    else:
+        raise SystemExit("usage: omaglow profile save | use on|off [theme] | delete [theme]")
+    save_config(config)
+    apply(config)
+
+
+def startup_enabled():
+    return systemctl("is-enabled", APPLY_UNIT).stdout.strip() == "enabled"
+
+
+def set_startup(on):
+    systemctl("enable" if on else "disable", SERVER_UNIT, APPLY_UNIT)
+
+
+def set_value(key, value):
+    config = load_config()
+    if key == "startup":
+        set_startup(value in ("on", "true", "1"))
+        return
+    if key == "color" and config["follow"]:
+        pattern = follow_pattern(config)
+        pattern["themeKey"] = normalize_hex(value)
+        pattern["themeKeys"] = {}
+    elif key == "color":
+        config["color"] = normalize_hex(value)
+        config["colors"] = {}
+    elif key == "follow":
+        config["follow"] = value in ("on", "true", "1")
+    elif key == "themeKey":
+        if value not in THEME_KEYS:
+            raise SystemExit(f"unknown theme colour: {value}")
+        config["follow"] = True
+        pattern = follow_pattern(config)
+        pattern["themeKey"] = value
+        pattern["themeKeys"] = {}
+    elif key == "brightness":
+        config["brightness"] = max(5, min(100, int(float(value))))
+    elif key == "vivid":
+        config["vivid"] = value in ("on", "true", "1")
+    else:
+        raise SystemExit(f"unknown setting: {key}")
+    save_config(config)
+    apply(config)
+
+
+def set_device(device_id, state):
+    config = load_config()
+    disabled = [d for d in config["disabled"] if d != device_id]
+    if state == "off":
+        disabled.append(device_id)
+    config["disabled"] = disabled
+    save_config(config)
+    apply(config)
+
+
+def set_device_color(device_id, value):
+    config = load_config()
+    if value == "shared":
+        (follow_pattern(config)["themeKeys"] if config["follow"] else config["colors"]).pop(device_id, None)
+    elif value.startswith("theme:"):
+        if value[6:] not in THEME_KEYS:
+            raise SystemExit(f"unknown theme colour: {value[6:]}")
+        config["follow"] = True
+        follow_pattern(config)["themeKeys"][device_id] = value[6:]
+    elif config["follow"]:
+        follow_pattern(config)["themeKeys"][device_id] = normalize_hex(value)
+    else:
+        config["colors"][device_id] = normalize_hex(value)
+    save_config(config)
+    apply(config)
+
+
+def set_zone(device_id, zone, size):
+    config = load_config()
+    device = next((d for d in all_devices() if d["id"] == device_id), None)
+    target = next((z for z in (device or {}).get("zones", []) if z["index"] == zone), None)
+    if not target:
+        raise SystemExit("no such addressable zone")
+    size = max(0, min(target["max"], size))
+    config["zones"].setdefault(device_id, {})[str(zone)] = size
+    save_config(config)
+    sdk_resize(device["index"], zone, size)
+    DEVICE_CACHE.unlink(missing_ok=True)
+    apply(config)
+
+
+def save_color(value, keep):
+    config = load_config()
+    color = normalize_hex(value)
+    saved = [c for c in config["saved"] if c != color]
+    if keep:
+        saved.append(color)
+    config["saved"] = saved[-24:]
+    save_config(config)
+
+
+def forget(device_id):
+    """Disable the detector for a misdetected device."""
+    config = load_config()
+    if device_id == "fury":
+        if "fury" not in config["ignored"]:
+            config["ignored"].append("fury")
+        save_config(config)
+        return
+    name = device_id.split(":", 1)[1] if device_id.startswith("openrgb:") else ""
+    if not name:
+        raise SystemExit(f"no such device: {device_id}")
+    if name not in config["ignored"]:
+        config["ignored"].append(name)
+    config["disabled"] = [d for d in config["disabled"] if d != device_id]
+    save_config(config)
+    try:
+        mapping = json.loads(DETECTOR_MAP.read_text())
+    except (OSError, ValueError):
+        mapping = {}
+    settings_file = OPENRGB_DIR / "OpenRGB.json"
+    try:
+        settings = json.loads(settings_file.read_text())
+        detectors = settings["Detectors"]["detectors"]
+        for detector in mapping.get(name, [name]):
+            if detector in detectors:
+                detectors[detector] = False
+        settings_file.write_text(json.dumps(settings, indent=4))
+    except (OSError, ValueError, KeyError):
+        pass
+    systemctl("restart", SERVER_UNIT)
+    DEVICE_CACHE.unlink(missing_ok=True)
+
+
+def remember(name):
+    """Re-enable the detector for one removed device."""
+    config = load_config()
+    if name not in config["ignored"]:
+        return
+    config["ignored"] = [n for n in config["ignored"] if n != name]
+    save_config(config)
+    if name == "fury":
+        return
+    settings_file = OPENRGB_DIR / "OpenRGB.json"
+    try:
+        mapping = json.loads(DETECTOR_MAP.read_text())
+    except (OSError, ValueError):
+        mapping = {}
+    try:
+        settings = json.loads(settings_file.read_text())
+        detectors = settings["Detectors"]["detectors"]
+        known = [d for d in mapping.get(name, [name]) if d in detectors]
+        if not known:
+            raise KeyError(name)
+        for detector in known:
+            detectors[detector] = True
+        settings_file.write_text(json.dumps(settings, indent=4))
+    except (OSError, ValueError, KeyError):
+        setup()
+        return
+    systemctl("restart", SERVER_UNIT)
+    DEVICE_CACHE.unlink(missing_ok=True)
+
+
+def trim_detectors():
+    """Run one full detection and keep only the detectors that found a device."""
+    OPENRGB_DIR.mkdir(parents=True, exist_ok=True)
+    settings_file = OPENRGB_DIR / "OpenRGB.json"
+    settings_file.unlink(missing_ok=True)
+    try:
+        log = subprocess.run(["openrgb", "--config", str(OPENRGB_DIR), "--noautoconnect", "-l", "-vv"],
+                             capture_output=True, text=True, timeout=120).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ignored = load_config()["ignored"]
+    keep, last, mapping = [], "", {}
+    for line in log.splitlines():
+        enabled = re.match(r"^\[(.+)\] is enabled$", line.strip())
+        if enabled:
+            last = enabled.group(1)
+        elif line.strip().endswith("Registering RGB controller"):
+            name = re.match(r"^\[(.+)\] Registering", line.strip())
+            device = name.group(1) if name else ""
+            candidates = [c for c in (last, device) if c]
+            mapping[device] = candidates
+            if device in ignored:
+                continue
+            for candidate in candidates:
+                if candidate not in keep:
+                    keep.append(candidate)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    DETECTOR_MAP.write_text(json.dumps(mapping))
+    try:
+        settings = json.loads(settings_file.read_text())
+        detectors = settings["Detectors"]["detectors"]
+    except (OSError, ValueError, KeyError):
+        return keep
+    known = [name for name in keep if name in detectors]
+    if known:
+        for name in detectors:
+            detectors[name] = name in known
+        settings_file.write_text(json.dumps(settings, indent=4))
+    return known
+
+
+def setup():
+    first_time = not (UNIT_DIR / SERVER_UNIT).exists()
+    startup = first_time or startup_enabled()
+    if not shutil.which("openrgb"):
+        raise SystemExit("openrgb is not installed: omarchy pkg add openrgb")
+    helper = str(Path(__file__).resolve())
+    systemctl("stop", SERVER_UNIT)
+    kept = trim_detectors()
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_DIR / SERVER_UNIT).write_text(f"""[Unit]
+Description=OpenRGB server for Omaglow (localhost only)
+
+[Service]
+ExecStart=/usr/bin/openrgb --server --server-host {HOST} --server-port {PORT} --config {OPENRGB_DIR}
+Restart=on-failure
+RestartSec=5
+Nice=10
+
+[Install]
+WantedBy=default.target
+""")
+    (UNIT_DIR / APPLY_UNIT).write_text(f"""[Unit]
+Description=Apply the Omaglow colour at login
+Wants={SERVER_UNIT}
+After={SERVER_UNIT}
+
+[Service]
+Type=oneshot
+ExecStart={helper} apply --wait
+
+[Install]
+WantedBy=default.target
+""")
+    HOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HOOK_FILE.write_text(f"""#!/bin/bash
+[[ -x {helper} ]] && {helper} apply --if-follow >/dev/null 2>&1 &
+""")
+    HOOK_FILE.chmod(0o755)
+    systemctl("daemon-reload")
+    set_startup(startup)
+    systemctl("restart", SERVER_UNIT)
+    DEVICE_CACHE.unlink(missing_ok=True)
+    if not CONFIG_FILE.exists():
+        save_config(dict(DEFAULTS))
+    apply(load_config(), wait=30)
+    return kept
+
+
+def teardown():
+    systemctl("disable", "--now", SERVER_UNIT, APPLY_UNIT)
+    for path in (UNIT_DIR / SERVER_UNIT, UNIT_DIR / APPLY_UNIT, HOOK_FILE):
+        path.unlink(missing_ok=True)
+    systemctl("daemon-reload")
+
+
+def main(argv):
+    verb = argv[1] if len(argv) > 1 else "status"
+    # Read only, so it skips the lock and returns while the hook is applying.
+    if verb == "palette":
+        palette = theme_colors()
+        config = load_config()
+        pattern = follow_pattern(config)
+        print(json.dumps({"theme": [{"key": k, "color": palette[k]} for k in THEME_KEYS if k in palette],
+                          "themeKey": pattern["themeKey"], "themeKeys": pattern["themeKeys"],
+                          **theme_report(config)}))
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # One writer at a time. The theme hook and the panel can run together.
+    lock = open(CACHE_DIR / "lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if verb == "status":
+        print(json.dumps(status(fresh="--fresh" in argv)))
+    elif verb == "apply":
+        config = load_config()
+        if "--if-follow" in argv and not config["follow"]:
+            return
+        print(apply(config, wait=30 if "--wait" in argv else 3))
+    elif verb == "set" and len(argv) == 4:
+        set_value(argv[2], argv[3])
+        print(json.dumps(status()))
+    elif verb == "device" and len(argv) == 4 and argv[3] in ("on", "off"):
+        set_device(argv[2], argv[3])
+        print(json.dumps(status()))
+    elif verb == "device-color" and len(argv) == 4:
+        set_device_color(argv[2], argv[3])
+        print(json.dumps(status()))
+    elif verb == "profile" and len(argv) >= 3:
+        action = argv[2]
+        if action == "use" and len(argv) >= 4:
+            profile_command("use", argv[3], argv[4] if len(argv) > 4 else "")
+        else:
+            profile_command(action, "", argv[3] if len(argv) > 3 else "")
+        print(json.dumps(status()))
+    elif verb == "zone" and len(argv) == 5:
+        set_zone(argv[2], int(argv[3]), int(argv[4]))
+        print(json.dumps(status(fresh=True)))
+    elif verb == "forget" and len(argv) == 3:
+        forget(argv[2])
+        apply(load_config(), wait=25)
+        print(json.dumps(status(wait=25, fresh=True)))
+    elif verb == "remember" and len(argv) == 3:
+        remember(argv[2])
+        apply(load_config(), wait=25)
+        print(json.dumps(status(wait=25, fresh=True)))
+    elif verb == "remember":
+        config = load_config()
+        config["ignored"] = []
+        save_config(config)
+        setup()
+        print(json.dumps(status(wait=30, fresh=True)))
+    elif verb in ("save", "unsave") and len(argv) == 3:
+        save_color(argv[2], verb == "save")
+        print(json.dumps(status()))
+    elif verb == "setup":
+        setup()
+        print(json.dumps(status(wait=30, fresh=True)))
+    elif verb == "rescan":
+        setup()
+        print(json.dumps(status(wait=30, fresh=True)))
+    elif verb == "teardown":
+        teardown()
+    else:
+        raise SystemExit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

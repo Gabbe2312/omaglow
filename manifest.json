@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.gabbe2312.omaglow",
+  "name": "Omaglow",
+  "version": "1.0.0",
+  "author": "Gabbe2312",
+  "license": "MIT",
+  "description": "Set the colour of your RGB hardware from the bar. Pick a colour, set one per device, or let the hardware follow the Omarchy theme.",
+  "homepage": "https://github.com/Gabbe2312/omaglow",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omaglow",
+    "description": "Set the colour of your RGB hardware or follow the theme",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
