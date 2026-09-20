@@ -460,44 +460,75 @@ def i2c_read_high(bus, addr, reg):
     return -1
 
 
-def fury_sticks():
-    """Find FURY DDR5 RGB controllers. Only probes slots with an spd5118 device."""
-    if not shutil.which("i2cset"):
-        return None, []
-    bus = smbus_number()
-    if bus is None or not os.access(f"/dev/i2c-{bus}", os.R_OK | os.W_OK):
-        return bus, []
-    sticks = []
+def fury_slots(bus):
+    """SMBus addresses of the RGB controllers that may sit behind DDR5 slots."""
+    slots = []
     for spd in sorted(Path("/sys/bus/i2c/devices").glob(f"{bus}-005[0-7]")):
         try:
-            if (spd / "name").read_text().strip() != "spd5118":
-                continue
+            if (spd / "name").read_text().strip() == "spd5118":
+                slots.append(FURY_BASE + int(spd.name[-1], 16))
         except OSError:
             continue
-        addr = FURY_BASE + (int(spd.name[-1], 16))
-        if not i2c_write(bus, addr, 0x08, 0x53):
-            continue
-        time.sleep(0.01)
-        signature = "".join(chr(max(0, i2c_read_high(bus, addr, reg))) for reg in (1, 2, 3, 4))
-        i2c_write(bus, addr, 0x08, 0x44)
-        time.sleep(0.01)
-        if signature == "FURY":
-            sticks.append(addr)
-    return bus, sticks
+    return slots
+
+
+def fury_probe(bus, addr):
+    """Return "yes" for a FURY signature, "maybe" if the controller only answers, else "no"."""
+    # The bus is busy right after login, so one failed read proves nothing.
+    answered = False
+    for _ in range(3):
+        if i2c_write(bus, addr, 0x08, 0x53):
+            answered = True
+            time.sleep(0.01)
+            signature = "".join(chr(max(0, i2c_read_high(bus, addr, reg))) for reg in (1, 2, 3, 4))
+            i2c_write(bus, addr, 0x08, 0x44)
+            time.sleep(0.01)
+            if signature == "FURY":
+                return "yes"
+        time.sleep(0.05)
+    return "maybe" if answered else "no"
+
+
+def fury_sticks(known=()):
+    """Find FURY DDR5 RGB controllers. Only probes slots with an spd5118 device."""
+    if not shutil.which("i2cset"):
+        return None, [], 0
+    bus = smbus_number()
+    if bus is None or not os.access(f"/dev/i2c-{bus}", os.R_OK | os.W_OK):
+        return bus, [], 0
+    slots = fury_slots(bus)
+    found = {addr: "yes" if addr in known else fury_probe(bus, addr) for addr in slots}
+    # On some boards one slot returns garbage for the signature registers after
+    # a cold boot while everything else works (OpenRGB issue 4981). Memory comes
+    # in matched kits, so a slot that answers is accepted when another slot on
+    # the same bus has a valid signature.
+    verified = any(state == "yes" for state in found.values())
+    sticks = [addr for addr in slots if found[addr] == "yes" or (verified and found[addr] == "maybe")]
+    return bus, sticks, len(slots)
+
+
+FURY_PROBE_LIMIT = 5
 
 
 def fury_cached():
     boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
     cache = CACHE_DIR / "fury.json"
+    stored = {}
     try:
         stored = json.loads(cache.read_text())
-        if stored.get("boot") == boot:
-            return stored["bus"], stored["sticks"]
-    except (OSError, ValueError, KeyError):
-        pass
-    bus, sticks = fury_sticks()
+        if stored.get("boot") != boot:
+            stored = {}
+    except (OSError, ValueError):
+        stored = {}
+    sticks = stored.get("sticks", [])
+    tries = stored.get("tries", 0)
+    # A slot that did not answer is asked again on later runs, a few times. A
+    # stick missed during a busy login would otherwise stay missing until reboot.
+    if stored and "slots" in stored and (len(sticks) >= stored["slots"] or tries >= FURY_PROBE_LIMIT):
+        return stored["bus"], sticks
+    bus, sticks, slots = fury_sticks(known=sticks)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps({"boot": boot, "bus": bus, "sticks": sticks}))
+    cache.write_text(json.dumps({"boot": boot, "bus": bus, "sticks": sticks, "slots": slots, "tries": tries + 1}))
     return bus, sticks
 
 

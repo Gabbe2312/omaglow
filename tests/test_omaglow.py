@@ -238,6 +238,30 @@ class Profiles(Rig):
         self.assertEqual(self.lit()[GPU], "#ffffff")
 
 
+class FuryDetection(unittest.TestCase):
+    def setUp(self):
+        self.o = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.o.CACHE_DIR = Path(self.tmp.name)
+        self.answers = []
+        self.o.fury_sticks = lambda known=(): ("8", self.answers.pop(0), 2)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missed_stick_is_found_on_a_later_run(self):
+        self.answers = [[0x63], [0x61, 0x63]]
+        self.assertEqual(self.o.fury_cached()[1], [0x63])
+        self.assertEqual(self.o.fury_cached()[1], [0x61, 0x63])
+        self.assertEqual(self.o.fury_cached()[1], [0x61, 0x63])  # complete, no more probing
+
+    def test_probing_stops_after_the_limit(self):
+        self.answers = [[0x63]] * self.o.FURY_PROBE_LIMIT
+        for _ in range(self.o.FURY_PROBE_LIMIT + 2):
+            self.assertEqual(self.o.fury_cached()[1], [0x63])
+        self.assertEqual(self.answers, [])
+
+
 class Leds(unittest.TestCase):
     def setUp(self):
         self.o = load()

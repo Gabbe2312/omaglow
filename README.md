@@ -95,7 +95,9 @@ exits.
 - The helper does not make network connections and does not need root. Device
   access comes from the udev rules in the `openrgb` package.
 - SMBus writes only go to addresses that belong to a DDR5 slot reported by the
-  kernel, and only after the controller has answered with the FURY signature.
+  kernel, and only after a controller has answered with the FURY signature. On
+  some boards one slot returns garbage for the signature after a cold boot. That
+  slot is accepted if another slot on the same bus has a valid signature.
 - A lock file stops the theme hook and the panel from writing at the same time.
 
 ## Command line
