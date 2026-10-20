@@ -370,14 +370,34 @@ def sdk_resize(device, zone, size):
         return False
 
 
-def wait_for_server(seconds):
+def expected_count():
+    """How many devices the server listed last time detection was complete."""
+    try:
+        return int(json.loads(DEVICE_CACHE.read_text()).get("expected", 0))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def wait_for_server(seconds, expected=0):
+    """List the server's devices once detection has settled.
+
+    A freshly started server adds devices as it finds them. USB devices come
+    after the I2C ones, so the first answer at login can be missing the fan
+    hub. Wait until the list has as many devices as last time and has stopped
+    growing, or until the time is up.
+    """
     deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
+    best, previous = [], None
+    while True:
         devices = parse_devices(openrgb_client("-l"))
-        if devices:
+        if len(devices) > len(best):
+            best = devices
+        if devices and len(devices) >= expected and previous is not None and len(devices) == len(previous):
             return devices
+        if time.monotonic() >= deadline:
+            return best
+        previous = devices
         time.sleep(1)
-    return []
 
 
 def ensure_server(wait):
@@ -386,18 +406,23 @@ def ensure_server(wait):
             return []
         systemctl("start", SERVER_UNIT)
         wait = max(wait, 25)
-    return wait_for_server(wait)
+    return wait_for_server(wait, expected_count())
 
 
 def openrgb_devices(wait=3, fresh=False):
     """Devices from the server, cached per server pid."""
     pid = server_pid()
+    expected = 0
     if not fresh and pid:
         try:
             cached = json.loads(DEVICE_CACHE.read_text())
-            if cached.get("pid") == pid and cached.get("devices"):
+            expected = int(cached.get("expected", 0))
+            # A list shorter than last time is asked again. The server may
+            # simply not have been done when it was written.
+            if cached.get("pid") == pid and cached.get("devices") and "expected" in cached \
+                    and len(cached["devices"]) >= expected:
                 return cached["devices"]
-        except (OSError, ValueError):
+        except (OSError, ValueError, TypeError):
             pass
     devices = ensure_server(wait)
     seen = {}
@@ -421,7 +446,8 @@ def openrgb_devices(wait=3, fresh=False):
                     zone["size"] = size
     if devices:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        DEVICE_CACHE.write_text(json.dumps({"pid": server_pid(), "devices": devices}))
+        DEVICE_CACHE.write_text(json.dumps({"pid": server_pid(), "devices": devices,
+                                            "expected": max(len(devices), expected if not fresh else 0)}))
     return devices
 
 
