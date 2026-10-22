@@ -47,7 +47,10 @@ Open the panel and press Set up. This does the following:
   normal OpenRGB config is not changed.
 - Starts `omaglow-openrgb.service`, an OpenRGB server that only listens on
   `127.0.0.1`. It uses about 15 MB of memory.
-- Enables `omaglow-apply.service`, which restores your colours at login.
+- Enables `omaglow-apply.service`, which restores your colours at login. It
+  restarts the server once about 20 seconds later, because some USB devices
+  (the Corsair iCUE LINK hub for one) ignore colours when opened too soon
+  after power on.
 - Installs a `theme-set` hook that repaints the hardware on theme changes.
 
 Run `bin/omaglow teardown` to remove all of this again.

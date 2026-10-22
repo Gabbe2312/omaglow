@@ -7,7 +7,7 @@ page switching.
 
     omaglow status                     JSON with config, devices, theme colours
     omaglow palette                    JSON with the theme colours only (fast)
-    omaglow apply [--if-follow] [--wait]
+    omaglow apply [--if-follow] [--wait] [--login]
     omaglow set <key> <value>          color, themeKey, follow, brightness, vivid, startup
     omaglow device <id> on|off
     omaglow device-color <id> <hex|theme:key|shared>
@@ -19,6 +19,7 @@ page switching.
     omaglow forget <id>                remove a misdetected device
     omaglow remember [name]            bring one removed device back, or all
     omaglow setup / teardown / rescan
+    omaglow units                      rewrite the systemd units and the theme hook
 """
 
 import fcntl
@@ -869,14 +870,8 @@ def trim_detectors():
     return known
 
 
-def setup():
-    first_time = not (UNIT_DIR / SERVER_UNIT).exists()
-    startup = first_time or startup_enabled()
-    if not shutil.which("openrgb"):
-        raise SystemExit("openrgb is not installed: omarchy pkg add openrgb")
+def write_units():
     helper = str(Path(__file__).resolve())
-    systemctl("stop", SERVER_UNIT)
-    kept = trim_detectors()
     UNIT_DIR.mkdir(parents=True, exist_ok=True)
     (UNIT_DIR / SERVER_UNIT).write_text(f"""[Unit]
 Description=OpenRGB server for Omaglow (localhost only)
@@ -897,7 +892,7 @@ After={SERVER_UNIT}
 
 [Service]
 Type=oneshot
-ExecStart={helper} apply --wait
+ExecStart={helper} apply --wait --login
 
 [Install]
 WantedBy=default.target
@@ -908,6 +903,16 @@ WantedBy=default.target
 """)
     HOOK_FILE.chmod(0o755)
     systemctl("daemon-reload")
+
+
+def setup():
+    first_time = not (UNIT_DIR / SERVER_UNIT).exists()
+    startup = first_time or startup_enabled()
+    if not shutil.which("openrgb"):
+        raise SystemExit("openrgb is not installed: omarchy pkg add openrgb")
+    systemctl("stop", SERVER_UNIT)
+    kept = trim_detectors()
+    write_units()
     set_startup(startup)
     systemctl("restart", SERVER_UNIT)
     DEVICE_CACHE.unlink(missing_ok=True)
@@ -915,6 +920,24 @@ WantedBy=default.target
         save_config(dict(DEFAULTS))
     apply(load_config(), wait=30)
     return kept
+
+
+LOGIN_SETTLE = 20
+
+
+def login_settle(lock):
+    """Open the USB devices a second time, once they have had time to boot.
+
+    The Corsair iCUE LINK hub is detected right after login but ignores colour
+    packets when OpenRGB opened it too soon after power on. Opening it again
+    later works, so the server is restarted once and the colours sent again.
+    """
+    fcntl.flock(lock, fcntl.LOCK_UN)
+    time.sleep(LOGIN_SETTLE)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    systemctl("restart", SERVER_UNIT)
+    DEVICE_CACHE.unlink(missing_ok=True)
+    apply(load_config(), wait=30)
 
 
 def teardown():
@@ -939,13 +962,17 @@ def main(argv):
     # One writer at a time. The theme hook and the panel can run together.
     lock = open(CACHE_DIR / "lock", "w")
     fcntl.flock(lock, fcntl.LOCK_EX)
-    if verb == "status":
+    if verb == "units":
+        write_units()
+    elif verb == "status":
         print(json.dumps(status(fresh="--fresh" in argv)))
     elif verb == "apply":
         config = load_config()
         if "--if-follow" in argv and not config["follow"]:
             return
         print(apply(config, wait=30 if "--wait" in argv else 3))
+        if "--login" in argv:
+            login_settle(lock)
     elif verb == "set" and len(argv) == 4:
         set_value(argv[2], argv[3])
         print(json.dumps(status()))
