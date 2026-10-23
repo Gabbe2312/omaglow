@@ -922,7 +922,7 @@ def setup():
     return kept
 
 
-LOGIN_SETTLE = 20
+LOGIN_SETTLE = 8
 
 
 def login_settle(lock):
