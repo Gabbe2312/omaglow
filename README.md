@@ -87,6 +87,7 @@ exits.
 - Devices without any static colour mode are not listed.
 - Off means black. A device that glows when set to black will still glow.
 - Before login the hardware uses its own lighting.
+- Needs OpenRGB 1.0rc3 or newer. Tested with 1.0rc3 and 1.1.
 - Tested on one machine with an MSI GPU, an ASUS Aura motherboard, a Corsair
   iCUE LINK hub and Kingston FURY DDR5. Reports from other hardware are
   welcome.

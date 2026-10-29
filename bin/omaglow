@@ -243,25 +243,6 @@ def openrgb_client(*args, timeout=30):
         return None
 
 
-MODE_RE = re.compile(r"\[?'([^']+)'\]?|\[?([^\s\[\]']+)\]?")
-
-
-def parse_devices(listing):
-    devices = []
-    current = None
-    for line in (listing or "").splitlines():
-        head = re.match(r"^(\d+): (.+)$", line)
-        if head:
-            current = {"index": int(head.group(1)), "name": head.group(2).strip(),
-                       "type": "", "modes": []}
-            devices.append(current)
-        elif current and line.startswith("  Type:"):
-            current["type"] = line.split(":", 1)[1].strip()
-        elif current and line.startswith("  Modes:"):
-            current["modes"] = [a or b for a, b in MODE_RE.findall(line.split(":", 1)[1])]
-    return devices
-
-
 def pick_mode(modes):
     for wanted in ("Static", "Direct", "Custom"):
         if wanted in modes:
@@ -326,39 +307,53 @@ def sdk_connect():
     return sock
 
 
-def sdk_zones():
-    """Resizable zones (addressable headers) per device index."""
+DEVICE_TYPES = ["Motherboard", "DRAM", "GPU", "Cooler", "LEDStrip", "Keyboard", "Mouse", "Mousemat",
+                "Headset", "HeadsetStand", "Gamepad", "Light", "Speaker", "Virtual", "Storage", "Case",
+                "Microphone", "Accessory", "Keypad", "Laptop", "Monitor"]
+
+
+def sdk_devices():
+    """Devices from the server: index, name, type, mode names and resizable zones.
+
+    Read over the SDK rather than from the CLI listing. The listing changed
+    format in OpenRGB 1.1, the protocol did not.
+    """
     try:
         with sdk_connect() as sock:
             sdk_send(sock, 0, SDK_CONTROLLER_COUNT)
             count = struct.unpack("<I", sdk_recv(sock, SDK_CONTROLLER_COUNT))[0]
-            found = {}
+            devices = []
             for device in range(min(count, 64)):
                 sdk_send(sock, device, SDK_CONTROLLER_DATA, struct.pack("<I", SDK_VERSION))
                 r = SdkReader(sdk_recv(sock, SDK_CONTROLLER_DATA))
-                r.take("I"); r.take("i")
-                for _ in range(6):
+                r.take("I")
+                kind = r.take("i")
+                name = r.text()
+                for _ in range(5):
                     r.text()
-                modes = r.take("H"); r.take("i")
-                for _ in range(modes):
-                    r.text()
+                mode_count = r.take("H")
+                r.take("i")
+                modes = []
+                for _ in range(mode_count):
+                    modes.append(r.text())
                     r.at += 12 * 4
-                    # Read into a variable first. r.at += r.take() would use the old offset.
                     colours = r.take("H")
                     r.at += 4 * colours
                 zones = []
                 for index in range(r.take("H")):
-                    name = r.text(); r.take("i")
+                    zone_name = r.text()
+                    r.take("i")
                     low, high, size = r.take("I"), r.take("I"), r.take("I")
                     matrix = r.take("H")
                     r.at += matrix
                     if low != high:
-                        zones.append({"index": index, "name": name, "max": high, "size": size})
-                if zones:
-                    found[device] = zones
-            return found
-    except (OSError, struct.error):
-        return {}
+                        zones.append({"index": index, "name": zone_name, "max": high, "size": size})
+                devices.append({"index": device, "name": name,
+                                "type": DEVICE_TYPES[kind] if 0 <= kind < len(DEVICE_TYPES) else "",
+                                "modes": modes, "zones": zones})
+            return devices
+    except (OSError, struct.error, IndexError):
+        return []
 
 
 def sdk_resize(device, zone, size):
@@ -390,7 +385,7 @@ def wait_for_server(seconds, expected=0):
     deadline = time.monotonic() + seconds
     best, previous = [], None
     while True:
-        devices = parse_devices(openrgb_client("-l"))
+        devices = sdk_devices() if port_open() else []
         if len(devices) > len(best):
             best = devices
         if devices and len(devices) >= expected and previous is not None and len(devices) == len(previous):
@@ -436,9 +431,7 @@ def openrgb_devices(wait=3, fresh=False):
         device["mode"] = pick_mode(device["modes"])
     config = load_config()
     devices = [d for d in devices if d["mode"] and d["name"] not in config["ignored"]]
-    zones = sdk_zones() if devices else {}
     for device in devices:
-        device["zones"] = zones.get(device["index"], [])
         wanted = config["zones"].get(device["id"], {})
         for zone in device["zones"]:
             size = wanted.get(str(zone["index"]))
@@ -841,13 +834,17 @@ def trim_detectors():
         return []
     ignored = load_config()["ignored"]
     keep, last, mapping = [], "", {}
-    for line in log.splitlines():
-        enabled = re.match(r"^\[(.+)\] is enabled$", line.strip())
+    for raw in log.splitlines():
+        # 1.1 prefixes every line with [time][level] and names the detector
+        # after the tag; 1.0 put the detector in the tag.
+        line = re.sub(r"^(\[[^\]]*\]){2}", "", raw.strip()).strip()
+        enabled = re.match(r"^\[DetectionManager\] (.+) is enabled$", line) or re.match(r"^\[(.+)\] is enabled$", line)
+        registered = re.match(r"^\[DetectionManager\] Registering RGB controller (.+)$", line) \
+            or re.match(r"^\[(.+)\] Registering RGB controller$", line)
         if enabled:
             last = enabled.group(1)
-        elif line.strip().endswith("Registering RGB controller"):
-            name = re.match(r"^\[(.+)\] Registering", line.strip())
-            device = name.group(1) if name else ""
+        elif registered:
+            device = registered.group(1).strip()
             candidates = [c for c in (last, device) if c]
             mapping[device] = candidates
             if device in ignored:
